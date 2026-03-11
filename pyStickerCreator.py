@@ -70,7 +70,7 @@ def strip_leading_zeros_keep_zero(s):
 
 def safe_filename_component(value, default=""):
 	s = sanitize_any(value, default=default) or default
-	s = re.sub(r'[\/*?:"<>|]', "_", s)
+	s = re.sub(r'[\\/*?:"<>|]', "_", s)
 	s = re.sub(r"\s+", " ", s).strip()
 	return s
 
@@ -83,7 +83,7 @@ def truncate_component(value, max_len):
 
 
 def normalize_for_match(s):
-	# Lower + strip accents for robust header matching (e.g. Quantity vs Quantity/Stückzahl)
+	# Lower + strip accents for robust header matching
 	if s is None:
 		return ""
 	s = str(s).strip().lower()
@@ -95,15 +95,16 @@ def normalize_for_match(s):
 def build_column_map(header_row):
 	"""Build a best-effort column index map from the CSV header row.
 
-	Supports both the old German headers and more generic English ones.
+	Supports both old and new header names.
 
 	Columns:
 	- COMPANY (optional; defaults to 'COMPANY_NAME' if missing)
 	- ARTICLE / ARTIKEL
 	- QUANTITY / STUCKZAHL / STUECKZAHL
-	- BATCH / CHARGEN
+	- ORDER INDEX / BATCH / CHARGEN
 	- ORDER / BESTELL (optional)
 	- CARTON / KARTON
+	- WEIGHT / GEWICHT (optional)
 	"""
 	normalized = [normalize_for_match(h) for h in header_row]
 
@@ -118,9 +119,10 @@ def build_column_map(header_row):
 		"company": find_idx([r"\bcompany\b", r"\bfirma\b", r"\bunternehmen\b"]),
 		"article": find_idx([r"artikel", r"item\s*no", r"article\s*no", r"\bsku\b", r"\bitem\b", r"\barticle\b"]),
 		"quantity": find_idx([r"stuckzahl", r"stueckzahl", r"quantity", r"qty", r"menge"]),
-		"batch": find_idx([r"chargen", r"batch"]),
+		"order_index": find_idx([r"order\s*index", r"batch", r"chargen"]),
 		"order": find_idx([r"bestell", r"order"]),
 		"carton": find_idx([r"karton", r"carton"]),
+		"weight": find_idx([r"\bweight\b", r"\bgewicht\b"]),
 	}
 
 
@@ -134,42 +136,55 @@ def get_cell(row, idx, default=""):
 # -----------------------------
 # Core: one PDF generation
 # -----------------------------
-def generate_pdf(company_raw, artikel_raw, qty_raw, batch_raw, order_raw, carton_no):
+def generate_pdf(company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, carton_no, weight_raw):
 	company = sanitize_any(company_raw, default="COMPANY_NAME")
 
 	# Display values (no modification other than trimming)
 	artikel_display = sanitize_any(artikel_raw, default="")
 	order_display = sanitize_any(order_raw, default="")
+	order_index_display = sanitize_any(order_index_raw, default="1")
+	weight_display = sanitize_any(weight_raw, default="")
 
-	# Quantity display: keep as number without padding (same as before)
+	# Quantity display: keep as number without padding
 	qty_digits = sanitize_numeric_keep_zeros(qty_raw, default="0")
 	quantity_display = strip_leading_zeros_keep_zero(qty_digits)
-
-	# Batch: allow alphanumeric (generic)
-	batch_display = sanitize_any(batch_raw, default="1")
 
 	# -----------------------------
 	# Barcode value (Code 128)
 	# Required format:
-	# ARTICLE_NO|QUANTITY|BATCH_NO|CARTON_NO
+	# ARTICLE_NO|QUANTITY|ORDER_INDEX|CARTON_NO
 	# -----------------------------
-	barcode_data = f"{artikel_display}|{qty_digits}|{batch_display}|{carton_no}"
+	barcode_data = f"{artikel_display}|{qty_digits}|{order_index_display}|{carton_no}"
 
 	# Safe components for filename
 	company_safe = truncate_component(safe_filename_component(company, default="Company"), 40)
 	order_safe = truncate_component(safe_filename_component(order_display, default="NoOrderNo"), 40)
-	batch_safe = truncate_component(safe_filename_component(batch_display, default="Batch"), 20)
-	barcode_safe = truncate_component(safe_filename_component(barcode_data, default="Barcode"), 80)
+	order_index_safe = truncate_component(safe_filename_component(order_index_display, default="OrderIndex"), 20)
 
-	pdf_file = f"{company_safe} - Order {order_safe}, Batch {batch_safe}, Box {carton_no}.pdf"
+	pdf_file = f"{company_safe} - Order {order_safe}, Index {order_index_safe}, Article {artikel_display}, Box {carton_no}.pdf"
 
 	c = canvas.Canvas(pdf_file, pagesize=A4)
 	page_w, page_h = A4
 
-	# Margins & label frame (fills width)
+	# Row heights
+	# [Header, Artikel, Quantity, Barcode, Order Index, Order, Carton, Weight]
+	row_heights = [
+		90,   # Header row for company
+		70,   # Article No.
+		70,   # Quantity
+		150,  # Barcode
+		70,   # Order Index
+		70,   # Order No.
+		70,   # Box No.
+		70,   # Weight
+	]
+
+	# Margins & label frame
+	# Make the outer border match the actual content height exactly,
+	# so layout changes do not leave an empty block at the bottom.
 	margin_x = 36  # ~0.5 inch
 	label_w = page_w - 2 * margin_x
-	label_h = page_h - 140  # breathing room
+	label_h = sum(row_heights)
 	label_x = margin_x
 	label_y = (page_h - label_h) / 2
 
@@ -177,18 +192,6 @@ def generate_pdf(company_raw, artikel_raw, qty_raw, batch_raw, order_raw, carton
 	c.setLineWidth(3)  # outer border
 	c.rect(label_x, label_y, label_w, label_h)
 	c.setLineWidth(1.5)  # inner lines
-
-	# Row heights
-	# [Header, Artikel, Quantity, Barcode, Batch, Order, Carton]
-	row_heights = [
-		90,   # Header row for company
-		70,   # Article No.
-		70,   # Quantity
-		150,  # Barcode
-		70,   # Batch
-		70,   # Order
-		70,   # Carton
-	]
 
 	row_top = label_y + label_h
 	col1_w = label_w * 0.45
@@ -311,7 +314,7 @@ def generate_pdf(company_raw, artikel_raw, qty_raw, batch_raw, order_raw, carton
 	barcode_x = label_x + (label_w - barcode_w) / 2
 	barcode_y = (row_top - rh) + top_pad + (size_height_target - barcode_h) / 2
 
-	# Intentional offset to prevent overlap (kept from your original)
+	# Intentional offset to prevent overlap
 	barcode_obj.drawOn(c, barcode_x, (barcode_y + 15))
 
 	# Human-readable text at the bottom (same as barcode payload)
@@ -324,7 +327,7 @@ def generate_pdf(company_raw, artikel_raw, qty_raw, batch_raw, order_raw, carton
 	# Order Index
 	# -----------------------------
 	rh = row_heights[4]
-	draw_row(row_top, rh, "Order Index", "(Nth item in your order)", batch_display, shrinkable=True)
+	draw_row(row_top, rh, "Order Index", "(Nth item in your order)", order_index_display, shrinkable=True)
 	row_top -= rh
 
 	# -----------------------------
@@ -340,7 +343,13 @@ def generate_pdf(company_raw, artikel_raw, qty_raw, batch_raw, order_raw, carton
 	rh = row_heights[6]
 	draw_row(row_top, rh, "Box No.", "(Nth box for this Article No.)", str(carton_no))
 	row_top -= rh
-	row_top -= rh  # kept as in your original code
+
+	# -----------------------------
+	# Weight
+	# -----------------------------
+	rh = row_heights[7]
+	draw_row(row_top, rh, "Weight", "(Box weight)", weight_display, shrinkable=True)
+	row_top -= rh
 
 	c.save()
 	print(f"PDF saved as {pdf_file}")
@@ -357,9 +366,10 @@ def run_csv(csv_path):
 	- COMPANY (new): displayed in the header row
 	- Artikel-Nr / Article No / Item No / SKU (required)
 	- Quantity / Stueckzahl / Quantity / Qty (required)
-	- Chargen-Nr / Batch (required)
+	- Order Index / Batch / Chargen-Nr (required)
 	- Bestell-Nr / Order (optional)
 	- Karton-Nr / Carton (required; if value > 1, generates that many labels with carton numbers 1..N)
+	- Weight / Gewicht (optional)
 	"""
 	with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
 		reader = csv.reader(f, delimiter=";", quotechar='"')
@@ -381,9 +391,10 @@ def run_csv(csv_path):
 			company_raw = get_cell(row, colmap.get("company"), default="COMPANY_NAME")
 			artikel_raw = get_cell(row, colmap.get("article"), default="")
 			qty_raw = get_cell(row, colmap.get("quantity"), default="0")
-			batch_raw = get_cell(row, colmap.get("batch"), default="1")
+			order_index_raw = get_cell(row, colmap.get("order_index"), default="1")
 			order_raw = get_cell(row, colmap.get("order"), default="")
 			karton_raw = get_cell(row, colmap.get("carton"), default="1")
+			weight_raw = get_cell(row, colmap.get("weight"), default="")
 
 			# Expand into multiple PDFs when Karton-Nr > 1
 			karton_digits = sanitize_numeric_keep_zeros(karton_raw, default="1")
@@ -396,7 +407,7 @@ def run_csv(csv_path):
 				k_total = 1
 
 			for k in range(1, k_total + 1):
-				generate_pdf(company_raw, artikel_raw, qty_raw, batch_raw, order_raw, str(k))
+				generate_pdf(company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, str(k), weight_raw)
 
 # -----------------------------
 # Entry
