@@ -108,23 +108,48 @@ def build_column_map(header_row):
 	"""
 	normalized = [normalize_for_match(h) for h in header_row]
 
-	def find_idx(patterns):
+	def find_idx(patterns, exclude_patterns=None):
+		exclude_patterns = exclude_patterns or []
 		for i, h in enumerate(normalized):
+			if any(re.search(ex_p, h) for ex_p in exclude_patterns):
+				continue
 			for p in patterns:
 				if re.search(p, h):
 					return i
 		return None
 
+	order_index_idx = find_idx([
+		r"^order\s*index$",
+		r"^orderindex$",
+		r"^batch$",
+		r"^chargen(?:\s*-?\s*nr)?$",
+		r"order\s*index",
+		r"batch",
+		r"chargen",
+	])
+
+	order_idx = find_idx(
+		[
+			r"^bestell(?:\s|-)?nr$",
+			r"^bestellnummer$",
+			r"^order(?:\s|-)?no$",
+			r"^order(?:\s|-)?number$",
+			r"^order$",
+			r"bestell",
+			r"order",
+		],
+		exclude_patterns=[r"order\s*index", r"^orderindex$", r"batch", r"chargen"],
+	)
+
 	return {
 		"company": find_idx([r"\bcompany\b", r"\bfirma\b", r"\bunternehmen\b"]),
 		"article": find_idx([r"artikel", r"item\s*no", r"article\s*no", r"\bsku\b", r"\bitem\b", r"\barticle\b"]),
 		"quantity": find_idx([r"stuckzahl", r"stueckzahl", r"quantity", r"qty", r"menge"]),
-		"order_index": find_idx([r"order\s*index", r"batch", r"chargen"]),
-		"order": find_idx([r"bestell", r"order"]),
+		"order_index": order_index_idx,
+		"order": order_idx,
 		"carton": find_idx([r"karton", r"carton"]),
 		"weight": find_idx([r"\bweight\b", r"\bgewicht\b"]),
 	}
-
 
 def get_cell(row, idx, default=""):
 	if idx is None:
@@ -215,31 +240,35 @@ def generate_pdf(company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, 
 	row_top -= header_h
 
 	# -----------------------------
-	# Row helper (bold everywhere)
+	# Row helper
+	# - Main label: bold
+	# - Sub label: regular
+	# - Right-side value: regular
 	# -----------------------------
 	def draw_row(y_top, height, main_label, sub_label, value=None, shrinkable=False):
 		# Left & right boxes
 		c.rect(label_x, y_top - height, col1_w, height)
 		c.rect(label_x + col1_w, y_top - height, col2_w, height)
 
-		# Labels
+		# Left-side labels
 		main_label_font_size = 36
 		c.setFont(FONT_BOLD, main_label_font_size)
 		c.drawString(label_x + 12, y_top - 30, main_label)
 
-		c.setFont(FONT_BOLD, 18)
+		c.setFont(FONT_REGULAR, 18)
 		c.drawString(label_x + 12, y_top - 54, sub_label)
 
 		# Right-side value
 		if value is not None:
+			value = str(value)
 			font_size_val = main_label_font_size
 			if shrinkable:
-				text_w = pdfmetrics.stringWidth(value, FONT_BOLD, font_size_val)
+				text_w = pdfmetrics.stringWidth(value, FONT_REGULAR, font_size_val)
 				available_w_val = col2_w - 20
 				while text_w > available_w_val and font_size_val > 8:
 					font_size_val -= 1
-					text_w = pdfmetrics.stringWidth(value, FONT_BOLD, font_size_val)
-			c.setFont(FONT_BOLD, font_size_val)
+					text_w = pdfmetrics.stringWidth(value, FONT_REGULAR, font_size_val)
+			c.setFont(FONT_REGULAR, font_size_val)
 			text_y = y_top - (height / 2) - (font_size_val * 0.35)
 			c.drawString(label_x + col1_w + 10, text_y, value)
 
