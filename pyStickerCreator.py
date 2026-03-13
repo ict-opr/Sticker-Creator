@@ -20,6 +20,20 @@ def get_base_dir():
 BASE_DIR = get_base_dir()
 
 # -----------------------------
+# Behavior toggles
+# -----------------------------
+# Controls what value is shown for Box No.
+# - "per_article": restart at 1 for each CSV row/article (current/original behavior)
+# - "per_order": continue counting across all boxes that belong to the same Order No.
+#                If Order No. is empty for a row, it falls back to per_article for that row.
+CARTON_NUMBERING_MODE = "per_order"
+
+# Controls how PDFs are written.
+# - "multipage": write all labels into a single multi-page PDF
+# - "separate": write one PDF file per label (old behavior)
+PDF_OUTPUT_MODE = "multipage"
+
+# -----------------------------
 # Font setup (Fonts/ directory)
 # -----------------------------
 fonts_dir = os.path.join(BASE_DIR, "Fonts")
@@ -159,9 +173,9 @@ def get_cell(row, idx, default=""):
 	return row[idx]
 
 # -----------------------------
-# Core: one PDF generation
+# Core: one PDF page drawing
 # -----------------------------
-def generate_pdf(company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, carton_no, weight_raw):
+def draw_label_page(c, company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, carton_no, weight_raw):
 	company = sanitize_any(company_raw, default="COMPANY_NAME")
 
 	# Display values (no modification other than trimming)
@@ -179,16 +193,10 @@ def generate_pdf(company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, 
 	# Required format:
 	# ARTICLE_NO|QUANTITY|ORDER_INDEX|CARTON_NO
 	# -----------------------------
-	barcode_data = f"{artikel_display}|{qty_digits}|{order_index_display}|{carton_no}"
+	#barcode_data = f"{artikel_display}|{qty_digits}|{order_index_display}|{carton_no}" # Optimized from ORION Format
+	barcode_data = f"{artikel_display}" # SIMPLIFIED: SKU Only!
 
 	# Safe components for filename
-	company_safe = truncate_component(safe_filename_component(company, default="Company"), 40)
-	order_safe = truncate_component(safe_filename_component(order_display, default="NoOrderNo"), 40)
-	order_index_safe = truncate_component(safe_filename_component(order_index_display, default="OrderIndex"), 20)
-
-	pdf_file = f"{company_safe} - Order {order_safe}, Index {order_index_safe}, Article {artikel_display}, Box {carton_no}.pdf"
-
-	c = canvas.Canvas(pdf_file, pagesize=A4)
 	page_w, page_h = A4
 
 	# Row heights
@@ -370,7 +378,7 @@ def generate_pdf(company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, 
 	# Box No.
 	# -----------------------------
 	rh = row_heights[6]
-	draw_row(row_top, rh, "Box No.", "(Nth box for this Article No.)", str(carton_no))
+	draw_row(row_top, rh, "Box No.", "(Nth box in this order)", str(carton_no))
 	row_top -= rh
 
 	# -----------------------------
@@ -380,6 +388,67 @@ def generate_pdf(company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, 
 	draw_row(row_top, rh, "Weight", "(Box weight)", weight_display, shrinkable=True)
 	row_top -= rh
 
+
+
+
+def build_output_pdf_filename(csv_path, data_rows):
+	base_name = os.path.splitext(os.path.basename(csv_path))[0]
+	base_name = safe_filename_component(base_name, default="labels")
+
+	if not data_rows:
+		return f"{base_name}.pdf"
+
+	company_values = []
+	order_values = []
+
+	for row in data_rows:
+		company_value = truncate_component(safe_filename_component(row.get("company_raw"), default="Company"), 80)
+		order_value = truncate_component(safe_filename_component(row.get("order_raw"), default="OrderNo"), 80)
+
+		if company_value and company_value not in company_values:
+			company_values.append(company_value)
+		if order_value and order_value not in order_values:
+			order_values.append(order_value)
+
+	company_part = company_values[0] if company_values else base_name
+	order_part = order_values[0] if order_values else "OrderNo"
+
+	return f"{company_part} - Order {order_part}.pdf"
+
+
+
+def generate_separate_pdf(company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, carton_no, weight_raw):
+	company = sanitize_any(company_raw, default="COMPANY_NAME")
+	artikel_display = sanitize_any(artikel_raw, default="")
+	order_display = sanitize_any(order_raw, default="")
+	order_index_display = sanitize_any(order_index_raw, default="1")
+
+	company_safe = truncate_component(safe_filename_component(company, default="Company"), 40)
+	order_safe = truncate_component(safe_filename_component(order_display, default="NoOrderNo"), 40)
+	order_index_safe = truncate_component(safe_filename_component(order_index_display, default="OrderIndex"), 20)
+
+	pdf_file = f"{company_safe} - Order {order_safe}, Index {order_index_safe}, Article {artikel_display}, Box {carton_no}.pdf"
+	c = canvas.Canvas(pdf_file, pagesize=A4)
+	draw_label_page(c, company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, carton_no, weight_raw)
+	c.save()
+	print(f"PDF saved as {pdf_file}")
+
+
+
+def generate_multipage_pdf(pdf_file, pages):
+	c = canvas.Canvas(pdf_file, pagesize=A4)
+	for page in pages:
+		draw_label_page(
+			c,
+			page["company_raw"],
+			page["artikel_raw"],
+			page["qty_raw"],
+			page["order_index_raw"],
+			page["order_raw"],
+			page["carton_no"],
+			page["weight_raw"],
+		)
+		c.showPage()
 	c.save()
 	print(f"PDF saved as {pdf_file}")
 
@@ -405,6 +474,7 @@ def run_csv(csv_path):
 
 		header = None
 		colmap = None
+		data_rows = []
 
 		for row in reader:
 			# Skip empty rows
@@ -425,7 +495,6 @@ def run_csv(csv_path):
 			karton_raw = get_cell(row, colmap.get("carton"), default="1")
 			weight_raw = get_cell(row, colmap.get("weight"), default="")
 
-			# Expand into multiple PDFs when Karton-Nr > 1
 			karton_digits = sanitize_numeric_keep_zeros(karton_raw, default="1")
 			try:
 				k_total = int(karton_digits) if karton_digits else 1
@@ -435,8 +504,67 @@ def run_csv(csv_path):
 			if k_total < 1:
 				k_total = 1
 
-			for k in range(1, k_total + 1):
-				generate_pdf(company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, str(k), weight_raw)
+			data_rows.append({
+				"company_raw": company_raw,
+				"artikel_raw": artikel_raw,
+				"qty_raw": qty_raw,
+				"order_index_raw": order_index_raw,
+				"order_raw": order_raw,
+				"weight_raw": weight_raw,
+				"k_total": k_total,
+			})
+
+	mode = str(CARTON_NUMBERING_MODE).strip().lower()
+	valid_modes = {"per_article", "per_order"}
+	if mode not in valid_modes:
+		print(f'[WARNING] Invalid CARTON_NUMBERING_MODE: {CARTON_NUMBERING_MODE}. Falling back to "per_order".')
+		mode = "per_order"
+
+	output_mode = str(PDF_OUTPUT_MODE).strip().lower()
+	valid_output_modes = {"multipage", "separate"}
+	if output_mode not in valid_output_modes:
+		print(f'[WARNING] Invalid PDF_OUTPUT_MODE: {PDF_OUTPUT_MODE}. Falling back to "multipage".')
+		output_mode = "multipage"
+
+	order_counters = {}
+	pages_to_generate = []
+
+	for row_data in data_rows:
+		company_raw = row_data["company_raw"]
+		artikel_raw = row_data["artikel_raw"]
+		qty_raw = row_data["qty_raw"]
+		order_index_raw = row_data["order_index_raw"]
+		order_raw = row_data["order_raw"]
+		weight_raw = row_data["weight_raw"]
+		k_total = row_data["k_total"]
+
+		order_key = sanitize_any(order_raw, default="")
+
+		for _ in range(k_total):
+			if mode == "per_order" and order_key:
+				current_carton_no = order_counters.get(order_key, 0) + 1
+				order_counters[order_key] = current_carton_no
+			else:
+				current_carton_no = _ + 1
+
+			page_data = {
+				"company_raw": company_raw,
+				"artikel_raw": artikel_raw,
+				"qty_raw": qty_raw,
+				"order_index_raw": order_index_raw,
+				"order_raw": order_raw,
+				"carton_no": str(current_carton_no),
+				"weight_raw": weight_raw,
+			}
+
+			if output_mode == "multipage":
+				pages_to_generate.append(page_data)
+			else:
+				generate_separate_pdf(**page_data)
+
+	if output_mode == "multipage":
+		pdf_file = build_output_pdf_filename(csv_path, data_rows)
+		generate_multipage_pdf(pdf_file, pages_to_generate)
 
 # -----------------------------
 # Entry
