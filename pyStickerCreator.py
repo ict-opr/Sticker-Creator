@@ -22,16 +22,36 @@ BASE_DIR = get_base_dir()
 # -----------------------------
 # Behavior toggles
 # -----------------------------
-# Controls what value is shown for Box No.
-# - "per_article": restart at 1 for each CSV row/article (current/original behavior)
-# - "per_order": continue counting across all boxes that belong to the same Order No.
-#                If Order No. is empty for a row, it falls back to per_article for that row.
-CARTON_NUMBERING_MODE = "per_order"
+# Read Box No. directly from the sixth CSV column (zero-based index 5).
+# The original cell text is preserved; no counting or numeric conversion.
+BOX_NO_COLUMN_INDEX = 5
 
 # Controls how PDFs are written.
 # - "multipage": write all labels into a single multi-page PDF
 # - "separate": write one PDF file per label (old behavior)
 PDF_OUTPUT_MODE = "multipage"
+
+# Special format for any company whose name contains "Orion" (case-insensitive).
+ORION_KEYWORD = "orion"
+ORION_DISPLAY_NAME = "OV Flensburg"
+# For Orion labels, the barcode inserts the CSV quantity as four zero-padded digits.
+
+ORION_ROW_LABELS = {
+	"article": ("Artikel-Nr.", "Item No."),
+	"quantity": ("Stückzahl", "Quantity"),
+	"order_index": ("Chargen-Nr.", "Batch No."),
+	"order": ("Bestell-Nr.", "Order No."),
+	"carton": ("Karton-Nr.", "Carton No."),
+	"weight": ("Gewicht.", "Box Weight."),
+}
+DEFAULT_ROW_LABELS = {
+	"article": ("Article No.", "(SKU)"),
+	"quantity": ("Quantity", "(Per box)"),
+	"order_index": ("Order Index", "(Nth item in your order)"),
+	"order": ("Order No.", "(Your order number)"),
+	"carton": ("Box No.", "(Nth box in this order)"),
+	"weight": ("Weight", "(Box weight)"),
+}
 
 # -----------------------------
 # Font setup (Fonts/ directory)
@@ -80,6 +100,43 @@ def strip_leading_zeros_keep_zero(s):
 	s = sanitize_numeric_keep_zeros(s, default="0")
 	s2 = s.lstrip("0")
 	return s2 if s2 != "" else "0"
+
+
+def is_orion_company(company_raw):
+	"""Match Orion anywhere in the original first-column company text."""
+	return ORION_KEYWORD in str(company_raw or "").casefold()
+
+
+def format_orion_article(artikel_raw, qty_raw):
+	"""Return the display SKU, encoded digits, and visible barcode text.
+
+	Example: article 0000050076660000, quantity 10 ->
+	  display: 5007666 0000
+	  barcode: 00000500766600100000
+	  human-readable: (00)000500766600100000
+	For quantity 20, the encoded barcode instead contains 0020.
+	"""
+	article = sanitize_any(artikel_raw, default="")
+	if not re.fullmatch(r"[0-9]{16}", article):
+		raise ValueError(
+			f"Orion article number must contain exactly 16 digits; got {article!r}"
+		)
+
+	# Use the quantity from this CSV row, padded to exactly four digits.
+	quantity_digits = sanitize_numeric_keep_zeros(qty_raw, default="0")
+	quantity_number = int(quantity_digits)
+	if quantity_number > 9999:
+		raise ValueError(
+			f"Orion quantity must fit in four digits (0-9999); got {quantity_number}"
+		)
+	quantity_barcode = f"{quantity_number:04d}"
+
+	article_body, article_suffix = article[:-4], article[-4:]
+	article_display = f"{article_body.lstrip('0') or '0'} {article_suffix}"
+	barcode_data = f"{article_body}{quantity_barcode}{article_suffix}"
+	# Represent the first two digits as the (00) application-identifier label.
+	barcode_caption = f"(00){barcode_data[2:]}"
+	return article_display, barcode_data, barcode_caption
 
 
 def safe_filename_component(value, default=""):
@@ -176,9 +233,11 @@ def get_cell(row, idx, default=""):
 # Core: one PDF page drawing
 # -----------------------------
 def draw_label_page(c, company_raw, artikel_raw, qty_raw, order_index_raw, order_raw, carton_no, weight_raw):
-	company = sanitize_any(company_raw, default="COMPANY_NAME")
+	is_orion = is_orion_company(company_raw)
+	company = ORION_DISPLAY_NAME if is_orion else sanitize_any(company_raw, default="COMPANY_NAME")
+	row_labels = ORION_ROW_LABELS if is_orion else DEFAULT_ROW_LABELS
 
-	# Display values (no modification other than trimming)
+	# Standard customers retain the original unmodified article and SKU barcode.
 	artikel_display = sanitize_any(artikel_raw, default="")
 	order_display = sanitize_any(order_raw, default="")
 	order_index_display = sanitize_any(order_index_raw, default="1")
@@ -188,13 +247,11 @@ def draw_label_page(c, company_raw, artikel_raw, qty_raw, order_index_raw, order
 	qty_digits = sanitize_numeric_keep_zeros(qty_raw, default="0")
 	quantity_display = strip_leading_zeros_keep_zero(qty_digits)
 
-	# -----------------------------
-	# Barcode value (Code 128)
-	# Required format:
-	# ARTICLE_NO|QUANTITY|ORDER_INDEX|CARTON_NO
-	# -----------------------------
-	#barcode_data = f"{artikel_display}|{qty_digits}|{order_index_display}|{carton_no}" # Optimized from ORION Format
-	barcode_data = f"{artikel_display}" # SIMPLIFIED: SKU Only!
+	if is_orion:
+		artikel_display, barcode_data, barcode_caption = format_orion_article(artikel_raw, qty_digits)
+	else:
+		barcode_data = artikel_display
+		barcode_caption = barcode_data
 
 	# Safe components for filename
 	page_w, page_h = A4
@@ -281,17 +338,17 @@ def draw_label_page(c, company_raw, artikel_raw, qty_raw, order_index_raw, order
 			c.drawString(label_x + col1_w + 10, text_y, value)
 
 	# -----------------------------
-	# Article No. (full, unmodified; shrink-to-fit)
+	# Article No. (Orion has a special display transformation; shrink-to-fit)
 	# -----------------------------
 	rh = row_heights[1]
-	draw_row(row_top, rh, "Article No.", "(SKU)", artikel_display, shrinkable=True)
+	draw_row(row_top, rh, *row_labels["article"], artikel_display, shrinkable=True)
 	row_top -= rh
 
 	# -----------------------------
 	# Quantity (display WITHOUT padding)
 	# -----------------------------
 	rh = row_heights[2]
-	draw_row(row_top, rh, "Quantity", "(Per box)", quantity_display)
+	draw_row(row_top, rh, *row_labels["quantity"], quantity_display)
 	row_top -= rh
 
 	# -----------------------------
@@ -354,9 +411,9 @@ def draw_label_page(c, company_raw, artikel_raw, qty_raw, order_index_raw, order
 	# Intentional offset to prevent overlap
 	barcode_obj.drawOn(c, barcode_x, (barcode_y + 15))
 
-	# Human-readable text at the bottom (same as barcode payload)
+	# Human-readable barcode text (Orion uses the (00) identifier format).
 	c.setFont(FONT_REGULAR, text_size)
-	c.drawCentredString(label_x + label_w / 2, (row_top - rh) + text_pad_bottom, barcode_data)
+	c.drawCentredString(label_x + label_w / 2, (row_top - rh) + text_pad_bottom, barcode_caption)
 
 	row_top -= rh
 
@@ -364,28 +421,28 @@ def draw_label_page(c, company_raw, artikel_raw, qty_raw, order_index_raw, order
 	# Order Index
 	# -----------------------------
 	rh = row_heights[4]
-	draw_row(row_top, rh, "Order Index", "(Nth item in your order)", order_index_display, shrinkable=True)
+	draw_row(row_top, rh, *row_labels["order_index"], order_index_display, shrinkable=True)
 	row_top -= rh
 
 	# -----------------------------
 	# Order No. (shrink to fit)
 	# -----------------------------
 	rh = row_heights[5]
-	draw_row(row_top, rh, "Order No.", "(Your order number)", order_display, shrinkable=True)
+	draw_row(row_top, rh, *row_labels["order"], order_display, shrinkable=True)
 	row_top -= rh
 
 	# -----------------------------
 	# Box No.
 	# -----------------------------
 	rh = row_heights[6]
-	draw_row(row_top, rh, "Box No.", "(Nth box in this order)", str(carton_no))
+	draw_row(row_top, rh, *row_labels["carton"], str(carton_no))
 	row_top -= rh
 
 	# -----------------------------
 	# Weight
 	# -----------------------------
 	rh = row_heights[7]
-	draw_row(row_top, rh, "Weight", "(Box weight)", weight_display, shrinkable=True)
+	draw_row(row_top, rh, *row_labels["weight"], weight_display, shrinkable=True)
 	row_top -= rh
 
 
@@ -466,7 +523,7 @@ def run_csv(csv_path):
 	- Quantity / Stueckzahl / Quantity / Qty (required)
 	- Order Index / Batch / Chargen-Nr (required)
 	- Bestell-Nr / Order (optional)
-	- Karton-Nr / Carton (required; if value > 1, generates that many labels with carton numbers 1..N)
+	- BOX NO (sixth column, index 5; used exactly as written, one label per CSV row)
 	- Weight / Gewicht (optional)
 	"""
 	with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
@@ -492,17 +549,8 @@ def run_csv(csv_path):
 			qty_raw = get_cell(row, colmap.get("quantity"), default="0")
 			order_index_raw = get_cell(row, colmap.get("order_index"), default="1")
 			order_raw = get_cell(row, colmap.get("order"), default="")
-			karton_raw = get_cell(row, colmap.get("carton"), default="1")
+			karton_raw = get_cell(row, BOX_NO_COLUMN_INDEX, default="")
 			weight_raw = get_cell(row, colmap.get("weight"), default="")
-
-			karton_digits = sanitize_numeric_keep_zeros(karton_raw, default="1")
-			try:
-				k_total = int(karton_digits) if karton_digits else 1
-			except ValueError:
-				k_total = 1
-
-			if k_total < 1:
-				k_total = 1
 
 			data_rows.append({
 				"company_raw": company_raw,
@@ -511,14 +559,8 @@ def run_csv(csv_path):
 				"order_index_raw": order_index_raw,
 				"order_raw": order_raw,
 				"weight_raw": weight_raw,
-				"k_total": k_total,
+				"carton_no": karton_raw,
 			})
-
-	mode = str(CARTON_NUMBERING_MODE).strip().lower()
-	valid_modes = {"per_article", "per_order"}
-	if mode not in valid_modes:
-		print(f'[WARNING] Invalid CARTON_NUMBERING_MODE: {CARTON_NUMBERING_MODE}. Falling back to "per_order".')
-		mode = "per_order"
 
 	output_mode = str(PDF_OUTPUT_MODE).strip().lower()
 	valid_output_modes = {"multipage", "separate"}
@@ -526,41 +568,24 @@ def run_csv(csv_path):
 		print(f'[WARNING] Invalid PDF_OUTPUT_MODE: {PDF_OUTPUT_MODE}. Falling back to "multipage".')
 		output_mode = "multipage"
 
-	order_counters = {}
 	pages_to_generate = []
 
 	for row_data in data_rows:
-		company_raw = row_data["company_raw"]
-		artikel_raw = row_data["artikel_raw"]
-		qty_raw = row_data["qty_raw"]
-		order_index_raw = row_data["order_index_raw"]
-		order_raw = row_data["order_raw"]
-		weight_raw = row_data["weight_raw"]
-		k_total = row_data["k_total"]
+		# Generate exactly one label per CSV row, using its unchanged Box No. value.
+		page_data = {
+			"company_raw": row_data["company_raw"],
+			"artikel_raw": row_data["artikel_raw"],
+			"qty_raw": row_data["qty_raw"],
+			"order_index_raw": row_data["order_index_raw"],
+			"order_raw": row_data["order_raw"],
+			"carton_no": row_data["carton_no"],
+			"weight_raw": row_data["weight_raw"],
+		}
 
-		order_key = sanitize_any(order_raw, default="")
-
-		for _ in range(k_total):
-			if mode == "per_order" and order_key:
-				current_carton_no = order_counters.get(order_key, 0) + 1
-				order_counters[order_key] = current_carton_no
-			else:
-				current_carton_no = _ + 1
-
-			page_data = {
-				"company_raw": company_raw,
-				"artikel_raw": artikel_raw,
-				"qty_raw": qty_raw,
-				"order_index_raw": order_index_raw,
-				"order_raw": order_raw,
-				"carton_no": str(current_carton_no),
-				"weight_raw": weight_raw,
-			}
-
-			if output_mode == "multipage":
-				pages_to_generate.append(page_data)
-			else:
-				generate_separate_pdf(**page_data)
+		if output_mode == "multipage":
+			pages_to_generate.append(page_data)
+		else:
+			generate_separate_pdf(**page_data)
 
 	if output_mode == "multipage":
 		pdf_file = build_output_pdf_filename(csv_path, data_rows)
